@@ -1,5 +1,5 @@
 import json
-import multiprocessing
+import queue
 import random
 import time
 import urllib.parse
@@ -15,6 +15,7 @@ from pydantic import BaseModel
 
 from utils.const import *
 from utils.doc_process_util import split_doc_by_chunks
+from utils.notification_util import partition_records
 from utils.vector_util import get_embedding, get_or_create_table, search
 
 # using fsspec configuration to connect to minio
@@ -34,37 +35,45 @@ s3 = s3fs.S3FileSystem()
 
 context_df = []
 
-# multiprocessing queues to handle data
-add_data_queue = multiprocessing.Queue()
-delete_data_queue = multiprocessing.Queue()
+# in-process queues to handle data from webhook background tasks
+add_data_queue = queue.Queue()
+delete_data_queue = queue.Queue()
+
+
+def drain_queue(work_queue):
+    items = []
+    while True:
+        try:
+            items.append(work_queue.get_nowait())
+        except queue.Empty:
+            return items
 
 
 def add_vector_job():
-    data = []
     table = get_or_create_table()
-
-    while not add_data_queue.empty():
-        item = add_data_queue.get()
-        data.append(item)
+    data = drain_queue(add_data_queue)
 
     if len(data) > 0:
         df = pd.DataFrame(data)
         table.add(df)
-        table.compact_files()
+        try:
+            table.compact_files()
+        except ImportError as exc:
+            print(f"Skipping LanceDB compaction: {exc}")
         print(f"Total Rows Added: {len(table.to_pandas())}")
 
 
 def delete_vector_job():
     table = get_or_create_table()
-    source_data = []
-    while not delete_data_queue.empty():
-        item = delete_data_queue.get()
-        source_data.append(item)
+    source_data = drain_queue(delete_data_queue)
     if len(source_data) > 0:
         filter_data = ", ".join([f'"{d}"' for d in source_data])
         table.delete(f'source IN ({filter_data})')
-        table.compact_files()
-        table.cleanup_old_versions()
+        try:
+            table.compact_files()
+            table.cleanup_old_versions()
+        except ImportError as exc:
+            print(f"Skipping LanceDB cleanup: {exc}")
         print(f"Total Rows Deleted: {len(table.to_pandas())}")
 
 
@@ -96,13 +105,13 @@ async def shutdown_event():
 async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
     json_data = await request.json()
     print(json.dumps(json_data, indent=2))
-    if json_data["EventName"] == "s3:ObjectCreated:Put":
-        print("New object created!")
-        background_tasks.add_task(create_object_task, json_data)
-    if json_data["EventName"] == "s3:ObjectRemoved:Delete":
-        print("Object deleted!")
-        background_tasks.add_task(delete_object_task, json_data)
-    # print(json.dumps(json_data, indent=2))
+    created_records, removed_records = partition_records(json_data)
+    if created_records:
+        print(f"New document object(s) created: {len(created_records)}")
+        background_tasks.add_task(create_object_task, created_records)
+    if removed_records:
+        print(f"Document object(s) deleted: {len(removed_records)}")
+        background_tasks.add_task(delete_object_task, removed_records)
     return {"status": "success"}
 
 
@@ -110,17 +119,18 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
 async def receive_metadata_webhook(request: Request, background_tasks: BackgroundTasks):
     json_data = await request.json()
     print(json.dumps(json_data, indent=2))
-    if json_data["EventName"] == "s3:ObjectCreated:Put":
-        print("New Metadata created!")
-        background_tasks.add_task(create_metadata_task, json_data)
-    if json_data["EventName"] == "s3:ObjectRemoved:Delete":
-        print("Metadata deleted!")
-        background_tasks.add_task(delete_metadata_task, json_data)
+    created_records, removed_records = partition_records(json_data)
+    if created_records:
+        print(f"New metadata object(s) created: {len(created_records)}")
+        background_tasks.add_task(create_metadata_task, created_records)
+    if removed_records:
+        print(f"Metadata object(s) deleted: {len(removed_records)}")
+        background_tasks.add_task(delete_metadata_task, removed_records)
     return {"status": "success"}
 
 
-def create_metadata_task(json_data):
-    for record in json_data["Records"]:
+def create_metadata_task(records):
+    for record in records:
         bucket_name = record["s3"]["bucket"]["name"]
         object_key = urllib.parse.unquote(record["s3"]["object"]["key"])
         print(bucket_name,
@@ -138,16 +148,16 @@ def create_metadata_task(json_data):
     return "Task Completed!"
 
 
-def delete_metadata_task(json_data):
-    for record in json_data["Records"]:
+def delete_metadata_task(records):
+    for record in records:
         bucket_name = record["s3"]["bucket"]["name"]
         object_key = urllib.parse.unquote(record["s3"]["object"]["key"])
         delete_data_queue.put(f"{bucket_name}/{object_key}")
     return "Task completed!"
 
 
-def create_object_task(json_data):
-    for record in json_data["Records"]:
+def create_object_task(records):
+    for record in records:
         bucket_name = record["s3"]["bucket"]["name"]
         object_key = urllib.parse.unquote(record["s3"]["object"]["key"])
         print(record["s3"]["bucket"]["name"],
@@ -163,8 +173,8 @@ def create_object_task(json_data):
     return "Task completed!"
 
 
-def delete_object_task(json_data):
-    for record in json_data["Records"]:
+def delete_object_task(records):
+    for record in records:
         bucket_name = record["s3"]["bucket"]["name"]
         object_key = urllib.parse.unquote(record["s3"]["object"]["key"])
         s3.delete(f"warehouse/{METADATA_PREFIX}/{bucket_name}/{object_key}", recursive=True)
@@ -174,8 +184,7 @@ def delete_object_task(json_data):
 def llm_chat(user_question, history):
     history = history or []
     global context_df
-    user_message = f"**You**: {user_question}"
-    res = search(user_message)
+    res = search(user_question)
     documents = " ".join([d["text"].strip() for d in res.to_list()])
     context_df = res.to_pandas()
     context_df = context_df.drop(columns=['source', 'vector'])
@@ -221,13 +230,14 @@ def clear_events():
 
 with gr.Blocks(gr.themes.Soft()) as demo:
     gr.Markdown("## RAG with MinIO")
-    ch_interface = gr.ChatInterface(llm_chat, undo_btn=None, clear_btn="Clear")
+    ch_interface = gr.ChatInterface(llm_chat)
     ch_interface.chatbot.height = 600
     ch_interface.chatbot.show_label = False
     gr.Markdown("### Context Supplied")
     context_dataframe = gr.DataFrame(headers=["parent_source", "text", "_distance"], wrap=True)
+    clear_button = gr.ClearButton([ch_interface.chatbot, context_dataframe], value="Clear")
     # ch_interface.chatbot.likeable = True
-    ch_interface.clear_btn.click(clear_events, [], context_dataframe)
+    clear_button.click(clear_events, [], context_dataframe)
 
 
     @gr.on(ch_interface.output_components, inputs=[ch_interface.chatbot], outputs=[context_dataframe])
